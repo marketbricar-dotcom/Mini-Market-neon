@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { Product, ProductCategory, Currency } from '../types';
-import { Plus, Search, Package, Trash2, ScanBarcode, Edit, PlusCircle, Save, X, Filter, Tag, AlertCircle } from 'lucide-react';
+import { Plus, Search, Package, Trash2, ScanBarcode, Edit, PlusCircle, Save, X, Filter, Tag, AlertCircle, RefreshCw } from 'lucide-react';
 import BarcodeScanner from './BarcodeScanner';
 import { generateUUID } from '../services/storageService';
 
@@ -12,6 +12,8 @@ interface Props {
   rate: number;
   criticalThreshold?: number;
   onUpdateCriticalThreshold?: (threshold: number) => void;
+  onRefresh?: () => void;
+  isRefreshing?: boolean;
 }
 
 const initialProductState: Partial<Product> = {
@@ -34,7 +36,9 @@ const Inventory: React.FC<Props> = ({
   onDeleteProduct, 
   rate,
   criticalThreshold = 5,
-  onUpdateCriticalThreshold
+  onUpdateCriticalThreshold,
+  onRefresh,
+  isRefreshing = false
 }) => {
   const [view, setView] = useState<'LIST' | 'FORM'>('LIST');
   const [filterCat, setFilterCat] = useState<ProductCategory | 'ALL'>('ALL');
@@ -163,6 +167,17 @@ const Inventory: React.FC<Props> = ({
           <h2 className="text-lg font-bold text-slate-800">
               {view === 'LIST' ? 'Inventario' : (newProduct.id ? 'Editar Producto' : 'Agregar Producto')}
           </h2>
+          {onRefresh && view === 'LIST' && (
+            <button
+              onClick={onRefresh}
+              disabled={isRefreshing}
+              className="ml-2 p-1.5 text-slate-500 hover:text-blue-600 hover:bg-slate-200/70 rounded-lg transition-colors flex items-center gap-1.5 text-xs font-semibold"
+              title="Refrescar datos más recientes desde Neon"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-blue-600' : ''}`} />
+              <span className="hidden sm:inline">{isRefreshing ? 'Actualizando...' : 'Refrescar'}</span>
+            </button>
+          )}
         </div>
         <button
           onClick={() => {

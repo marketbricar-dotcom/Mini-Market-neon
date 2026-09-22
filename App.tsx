@@ -5,6 +5,7 @@ import SalesSystem from './components/SalesSystem';
 import Reports from './components/Reports';
 import Credits from './components/Credits';
 import AIAssistant from './components/AIAssistant';
+import { PublicCatalog } from './components/PublicCatalog';
 import { Product, Sale } from './types';
 import { supabaseService } from './services/supabaseService';
 import { safeSetItem, safeGetItem, safeRemoveItem, cleanStorageQuota } from './services/storageService';
@@ -41,7 +42,8 @@ import {
   Sparkles,
   BookOpen,
   Key,
-  Link2
+  Link2,
+  Store
 } from 'lucide-react';
 
 const App: React.FC = () => {
@@ -75,7 +77,28 @@ const App: React.FC = () => {
     }
   });
 
-  const [activeTab, setActiveTab] = useState<'RATE' | 'INVENTORY' | 'SALES' | 'CREDITS' | 'REPORTS' | 'AI'>('SALES');
+  // Detección de vista pública/cliente directa desde URL (?tab=CATALOG o ?public=true o ?catalogo=1)
+  const isStandalonePublicCatalog = useMemo(() => {
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      return urlParams.get('public') === 'true' || urlParams.get('standalone') === 'true';
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const [activeTab, setActiveTab] = useState<'RATE' | 'INVENTORY' | 'SALES' | 'CREDITS' | 'REPORTS' | 'AI' | 'CATALOG'>(() => {
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      const tabParam = (urlParams.get('tab') || urlParams.get('view') || '').toUpperCase();
+      if (tabParam === 'CATALOG' || urlParams.get('catalogo') === 'true' || urlParams.get('catalogo') === '1') {
+        return 'CATALOG';
+      }
+    } catch {
+      // fallback
+    }
+    return 'SALES';
+  });
 
   const [criticalThreshold, setCriticalThreshold] = useState<number>(() => {
     const saved = safeGetItem('venstore_critical_threshold');
@@ -432,9 +455,9 @@ const App: React.FC = () => {
     }
   };
 
-  // Dispara la sincronización en segundo plano con fusión segura
-  const triggerBackgroundSync = () => {
-    if (backgroundSyncing) return;
+  // Dispara la sincronización con Neon para refrescar los datos más recientes
+  const triggerBackgroundSync = (force?: boolean) => {
+    if (backgroundSyncing && !force) return;
     setBackgroundSyncing(true);
     setTimeout(async () => {
       try {
@@ -449,10 +472,16 @@ const App: React.FC = () => {
 
         if (supabaseService.isEnabled()) {
           try {
-            dbRate = await supabaseService.fetchExchangeRate(rateRef.current);
-            dbInventory = await supabaseService.fetchInventory();
-            dbSales = await supabaseService.fetchSales();
-            dbThreshold = await supabaseService.fetchCriticalThreshold(criticalThresholdRef.current);
+            const [freshRate, freshInv, freshSales, freshThreshold] = await Promise.all([
+              supabaseService.fetchExchangeRate(rateRef.current).catch(() => rateRef.current),
+              supabaseService.fetchInventory().catch(() => []),
+              supabaseService.fetchSales().catch(() => []),
+              supabaseService.fetchCriticalThreshold(criticalThresholdRef.current).catch(() => criticalThresholdRef.current)
+            ]);
+            dbRate = freshRate;
+            dbInventory = freshInv;
+            dbSales = freshSales;
+            dbThreshold = freshThreshold;
           } catch (e) {
             console.warn('Error fetching fresh DB data in background:', e);
           }
@@ -471,7 +500,7 @@ const App: React.FC = () => {
             sheetsConfigured: true,
             missingSheets: [],
             loading: false,
-            dbType: 'Supabase'
+            dbType: 'Neon PostgreSQL'
           }));
         }
       } catch (err) {
@@ -479,8 +508,21 @@ const App: React.FC = () => {
       } finally {
         setBackgroundSyncing(false);
       }
-    }, 100);
+    }, 50);
   };
+
+  // --- Consultar a Neon (fetchInventory) cada vez que cambie de pestaña en la aplicación ---
+  const isFirstMountTabRef = React.useRef(true);
+  useEffect(() => {
+    if (isFirstMountTabRef.current) {
+      isFirstMountTabRef.current = false;
+      return;
+    }
+    if (supabaseService.isEnabled()) {
+      console.log(`[Neon DB] Cambio de pestaña a "${activeTab}". Consultando Neon (fetchInventory) para refrescar datos...`);
+      triggerBackgroundSync(true);
+    }
+  }, [activeTab]);
 
   // --- Sincronizar al iniciar o al hacer clic manual ---
   const syncWithDatabase = async () => {
@@ -603,25 +645,35 @@ const App: React.FC = () => {
       }
     }, 4000);
 
-    // Re-sincronizar al volver a la pestaña o al recuperar internet
+    // Re-sincronizar al volver a la pestaña, al enfocar ventana o al recuperar internet
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible' && supabaseService.isEnabled()) {
-        syncWithDatabase();
+        console.log('[Neon DB] Pestaña visible. Refrescando datos e inventario desde Neon...');
+        triggerBackgroundSync(true);
+      }
+    };
+    const handleFocus = () => {
+      if (supabaseService.isEnabled()) {
+        console.log('[Neon DB] Ventana enfocada. Refrescando datos e inventario desde Neon...');
+        triggerBackgroundSync(true);
       }
     };
     const handleOnline = () => {
       if (supabaseService.isEnabled()) {
+        console.log('[Neon DB] Conexión a internet restablecida. Sincronizando con Neon...');
         syncWithDatabase();
       }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleFocus);
     window.addEventListener('online', handleOnline);
 
     return () => {
       if (unsubscribeRealtime) unsubscribeRealtime();
       clearInterval(syncInterval);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleFocus);
       window.removeEventListener('online', handleOnline);
     };
   }, []);
@@ -1116,6 +1168,20 @@ const App: React.FC = () => {
     </button>
   );
 
+  if (isStandalonePublicCatalog) {
+    return (
+      <div className="min-h-screen bg-slate-50 font-sans">
+        <PublicCatalog 
+          inventory={inventory} 
+          rate={rate} 
+          onRefresh={() => triggerBackgroundSync(true)}
+          isRefreshing={backgroundSyncing}
+          isStandalonePublicView={true}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-violet-50/30 text-indigo-950 font-sans">
       <div className="max-w-7xl mx-auto px-4 py-6">
@@ -1133,6 +1199,19 @@ const App: React.FC = () => {
 
           {/* Widget del Estado de Sincronización */}
           <div className="flex flex-wrap items-center justify-center md:justify-end gap-2">
+            <button
+              onClick={() => setActiveTab('CATALOG')}
+              className={`flex items-center gap-2 transition-colors px-4 py-2.5 rounded-full text-xs font-bold shadow-xs cursor-pointer border ${
+                activeTab === 'CATALOG'
+                  ? 'bg-emerald-600 text-white border-emerald-600'
+                  : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-200'
+              }`}
+              title="Abrir Catálogo Digital con Carrito y Pedidos por WhatsApp"
+            >
+              <Store className="w-4 h-4 text-emerald-600" />
+              Catálogo Clientes
+            </button>
+
             <button
               onClick={handleExportLocalInventory}
               className="flex items-center gap-2 bg-violet-600 hover:bg-violet-700 text-white transition-colors px-4 py-2.5 rounded-full text-xs font-bold shadow-sm cursor-pointer"
@@ -1480,6 +1559,17 @@ ALTER TABLE sales DISABLE ROW LEVEL SECURITY;
 
         {/* Barra de Navegación */}
         <div className="flex flex-wrap justify-center gap-3 mb-8">
+            <NavButton 
+              id="CATALOG" 
+              label="Catálogo WhatsApp" 
+              icon={Store} 
+              active={activeTab === 'CATALOG'} 
+              badge={
+                <span className="bg-emerald-500 text-white text-[10px] px-1.5 py-0.5 rounded-full font-black animate-pulse">
+                  Tienda
+                </span>
+              }
+            />
             <NavButton id="RATE" label="Calculadora Tasa" icon={Calculator} active={activeTab === 'RATE'} />
             <NavButton 
               id="INVENTORY" 
@@ -1500,6 +1590,16 @@ ALTER TABLE sales DISABLE ROW LEVEL SECURITY;
 
         {/* Contenido Dinámico */}
         <div className="animate-fade-in-up">
+            {activeTab === 'CATALOG' && (
+                <PublicCatalog 
+                  inventory={inventory} 
+                  rate={rate} 
+                  onRefresh={() => triggerBackgroundSync(true)}
+                  isRefreshing={backgroundSyncing}
+                  onExitCatalog={() => setActiveTab('SALES')}
+                />
+            )}
+
             {activeTab === 'RATE' && (
                 <ExchangeRate rate={rate} onUpdateRate={handleUpdateRate} />
             )}
@@ -1513,6 +1613,8 @@ ALTER TABLE sales DISABLE ROW LEVEL SECURITY;
                   rate={rate} 
                   criticalThreshold={criticalThreshold}
                   onUpdateCriticalThreshold={handleUpdateCriticalThreshold}
+                  onRefresh={() => triggerBackgroundSync(true)}
+                  isRefreshing={backgroundSyncing}
                 />
             )}
 
