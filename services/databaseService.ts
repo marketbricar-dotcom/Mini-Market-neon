@@ -313,6 +313,23 @@ export const databaseService = {
     }
   },
 
+  /**
+   * Guardado en bloque (Batch) de productos en Neon
+   */
+  async saveProductsBatch(products: Product[]): Promise<boolean> {
+    try {
+      if (!Array.isArray(products) || products.length === 0) return true;
+      const resp = await fetch('/api/db/products/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ products }),
+      });
+      return resp.ok;
+    } catch {
+      return false;
+    }
+  },
+
   async deleteProduct(productId: string): Promise<boolean> {
     try {
       const resp = await fetch(`/api/db/products/${encodeURIComponent(productId)}`, {
@@ -389,18 +406,68 @@ export const databaseService = {
   },
 
   /**
-   * Sincronización periódica en segundo plano
+   * Sincronización en tiempo real multiplataforma (SSE Push + Polling de Respaldo)
+   * Asegura que cualquier cambio en una PC o teléfono se refleje inmediatamente en todos los demás dispositivos.
    */
   subscribeToRealtime(onDataChanged: (tableName: string) => void): (() => void) {
-    const interval = setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        onDataChanged('products');
-        onDataChanged('sales');
-        onDataChanged('config');
-      }
-    }, 15000);
+    let eventSource: EventSource | null = null;
+    let fallbackInterval: any = null;
 
-    return () => clearInterval(interval);
+    try {
+      if (typeof window !== 'undefined' && 'EventSource' in window) {
+        eventSource = new EventSource('/api/db/events');
+
+        eventSource.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data && data.type) {
+              if (data.type === 'connected') return;
+              console.log(`[Neon Realtime SSE] Cambio detectado: ${data.type}`);
+              onDataChanged(data.type);
+            }
+          } catch {
+            onDataChanged('all');
+          }
+        };
+
+        eventSource.onerror = () => {
+          // EventSource se reconecta automáticamente en navegadores
+        };
+      }
+    } catch (e) {
+      console.warn('[Neon Realtime] Error inicializando SSE, usando polling:', e);
+    }
+
+    // Polling ligero de respaldo por si el teléfono pierde SSE o está en background
+    fallbackInterval = setInterval(async () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        try {
+          const resp = await fetch('/api/db/version');
+          if (resp.ok) {
+            const { version } = await resp.json();
+            const lastVersion = (window as any).__neon_last_version;
+            if (lastVersion && version && version !== lastVersion) {
+              console.log('[Neon Realtime Polling] Nueva versión de datos detectada en Neon');
+              onDataChanged('all');
+            }
+            (window as any).__neon_last_version = version;
+          }
+        } catch {
+          // Ignorar fallo de red puntual
+        }
+      }
+    }, 3500);
+
+    return () => {
+      if (eventSource) {
+        try {
+          eventSource.close();
+        } catch {}
+      }
+      if (fallbackInterval) {
+        clearInterval(fallbackInterval);
+      }
+    };
   },
 
   setRlsErrorListener(_listener: (tableName: string, errorMsg: string) => void) {

@@ -252,7 +252,7 @@ export const PublicCatalog: React.FC<Props> = ({
   const handleCopyCatalogLink = () => {
     const origin = window.location.origin;
     const pathname = window.location.pathname;
-    const catalogUrl = `${origin}${pathname}?tab=CATALOG`;
+    const catalogUrl = `${origin}${pathname}?public=true`;
     navigator.clipboard.writeText(catalogUrl).then(() => {
       setCopiedLink(true);
       setTimeout(() => setCopiedLink(false), 2500);

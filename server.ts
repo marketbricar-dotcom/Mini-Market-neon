@@ -13,6 +13,7 @@ import {
   setConfigValue,
   getProducts,
   upsertProduct,
+  upsertProductsBatch,
   deleteProduct,
   getSales,
   saveSaleTransaction,
@@ -26,6 +27,22 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
+
+// Sistema de eventos en tiempo real (SSE) para sincronizar inmediatamente todos los dispositivos (computadoras y teléfonos)
+let dbVersion = Date.now();
+const sseClients = new Set<express.Response>();
+
+function notifyChange(type: 'products' | 'sales' | 'config' | 'all') {
+  dbVersion = Date.now();
+  const payload = `data: ${JSON.stringify({ type, version: dbVersion, timestamp: Date.now() })}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(payload);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}
 
 async function startServer() {
   const app = express();
@@ -67,6 +84,37 @@ async function startServer() {
         error: err.message || 'Error al comprobar estado de la base de datos',
       });
     }
+  });
+
+  // 1b. Transmisión en Tiempo Real (Server-Sent Events) y Versión de Estado
+  app.get('/api/db/events', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    if (typeof (res as any).flushHeaders === 'function') {
+      (res as any).flushHeaders();
+    }
+
+    sseClients.add(res);
+    res.write(`data: ${JSON.stringify({ type: 'connected', version: dbVersion, timestamp: Date.now() })}\n\n`);
+
+    const keepAlive = setInterval(() => {
+      try {
+        res.write(`: ping\n\n`);
+      } catch {
+        clearInterval(keepAlive);
+        sseClients.delete(res);
+      }
+    }, 25000);
+
+    req.on('close', () => {
+      clearInterval(keepAlive);
+      sseClients.delete(res);
+    });
+  });
+
+  app.get('/api/db/version', (req, res) => {
+    res.json({ version: dbVersion });
   });
 
   // 2. Probar una URL de conexión de Neon específica
@@ -164,6 +212,7 @@ async function startServer() {
         return;
       }
       await setConfigValue(key, String(value ?? ''));
+      notifyChange('config');
       res.json({ success: true, key, value });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -200,6 +249,7 @@ async function startServer() {
         product.id = `prod-${Date.now()}`;
       }
       await upsertProduct(product);
+      notifyChange('products');
       res.json({ success: true });
     } catch (err: any) {
       console.error('[API POST /api/db/products] Error al guardar producto en Neon:', err);
@@ -210,10 +260,31 @@ async function startServer() {
   app.post('/api/db/products', handlePostInventory);
   app.post('/api/db/inventario', handlePostInventory);
 
+  // Guardado masivo (Batch) de productos en Neon
+  const handlePostInventoryBatch = async (req: express.Request, res: express.Response) => {
+    try {
+      const items = Array.isArray(req.body) ? req.body : req.body?.products;
+      if (!Array.isArray(items) || items.length === 0) {
+        res.status(400).json({ error: 'Lote de productos vacío o inválido' });
+        return;
+      }
+      const result = await upsertProductsBatch(items);
+      notifyChange('products');
+      res.json({ success: true, count: result.count });
+    } catch (err: any) {
+      console.error('[API POST /api/db/products/batch] Error en guardado masivo en Neon:', err);
+      res.status(500).json({ error: err.message });
+    }
+  };
+
+  app.post('/api/db/products/batch', handlePostInventoryBatch);
+  app.post('/api/db/inventario/batch', handlePostInventoryBatch);
+
   const handleDeleteInventory = async (req: express.Request, res: express.Response) => {
     try {
       const { id } = req.params;
       await deleteProduct(id);
+      notifyChange('products');
       res.json({ success: true });
     } catch (err: any) {
       console.error('[API DELETE /api/db/products] Error al eliminar producto en Neon:', err);
@@ -242,6 +313,10 @@ async function startServer() {
         return;
       }
       await saveSaleTransaction(sale, updatedInventory);
+      notifyChange('sales');
+      if (Array.isArray(updatedInventory) && updatedInventory.length > 0) {
+        notifyChange('products');
+      }
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -252,6 +327,7 @@ async function startServer() {
     try {
       const { id } = req.params;
       await deleteSale(id);
+      notifyChange('sales');
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -266,6 +342,7 @@ async function startServer() {
         return;
       }
       await updateSale(sale);
+      notifyChange('sales');
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message });

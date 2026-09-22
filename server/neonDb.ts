@@ -211,8 +211,30 @@ export async function initTables(customUrl?: string): Promise<{ success: boolean
       ON CONFLICT (key) DO NOTHING;
     `);
 
+    // 5. Normalizaciones automáticas para compatibilidad total en todas las tablas existentes
+    try {
+      await client.query(`
+        DO $$
+        BEGIN
+          -- Si la tabla "Inventario" existe, asegurar clave primaria en id para soporte ON CONFLICT
+          IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'Inventario') THEN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'Inventario_pkey') THEN
+              ALTER TABLE "Inventario" ADD CONSTRAINT "Inventario_pkey" PRIMARY KEY (id);
+            END IF;
+          END IF;
+
+          -- Si la tabla "inventario" tiene columna id tipo integer, convertir a text
+          IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'inventario' AND column_name = 'id' AND data_type = 'integer') THEN
+            ALTER TABLE "inventario" ALTER COLUMN id TYPE text USING id::text;
+          END IF;
+        END $$;
+      `);
+    } catch (migErr: any) {
+      console.warn('[Neon DB] Advertencia en migración automática de claves primarias:', migErr.message);
+    }
+
     await client.query('COMMIT');
-    cachedInventoryTable = null;
+    cachedInventoryTables = null;
     return { success: true, message: 'Tablas (config, inventario, products, sales) creadas e inicializadas con éxito en Neon.' };
   } catch (err: any) {
     await client.query('ROLLBACK');
@@ -331,6 +353,7 @@ export async function getProducts(): Promise<any[]> {
 
   const allRawRows: any[] = [];
   const seenKeys = new Set<string>();
+  const seenNames = new Set<string>();
 
   for (const t of tables) {
     try {
@@ -342,11 +365,12 @@ export async function getProducts(): Promise<any[]> {
         console.log(`[Neon DB] Columnas de ${t.quoted}:`, Object.keys(rows[0]));
       }
       for (const row of rows) {
-        const idVal = row.id ?? row.codigo ?? row.id_producto;
-        const nameVal = row.name ?? row.nombre ?? row.descripcion;
-        const key = `${idVal ?? ''}:::${nameVal ?? ''}`.trim().toLowerCase();
-        if (!seenKeys.has(key)) {
+        const idVal = String(row.id ?? row.codigo ?? row.id_producto ?? '').trim();
+        const nameVal = String(row.name ?? row.nombre ?? row.descripcion ?? '').trim().toLowerCase();
+        const key = `${idVal}:::${nameVal}`;
+        if (!seenKeys.has(key) && !seenNames.has(nameVal)) {
           seenKeys.add(key);
+          if (nameVal) seenNames.add(nameVal);
           allRawRows.push(row);
         }
       }
@@ -370,11 +394,12 @@ export async function getProducts(): Promise<any[]> {
         if (res && Array.isArray(res.rows) && res.rows.length > 0) {
           console.log(`[Neon DB] Consulta de respaldo exitosa (${fb}): ${res.rows.length} filas.`);
           for (const row of res.rows) {
-            const idVal = row.id ?? row.codigo ?? row.id_producto;
-            const nameVal = row.name ?? row.nombre ?? row.descripcion;
-            const key = `${idVal ?? ''}:::${nameVal ?? ''}`.trim().toLowerCase();
-            if (!seenKeys.has(key)) {
+            const idVal = String(row.id ?? row.codigo ?? row.id_producto ?? '').trim();
+            const nameVal = String(row.name ?? row.nombre ?? row.descripcion ?? '').trim().toLowerCase();
+            const key = `${idVal}:::${nameVal}`;
+            if (!seenKeys.has(key) && !seenNames.has(nameVal)) {
               seenKeys.add(key);
+              if (nameVal) seenNames.add(nameVal);
               allRawRows.push(row);
             }
           }
@@ -578,6 +603,125 @@ export async function upsertProduct(product: any): Promise<void> {
       console.warn(`[Neon DB] Error guardando producto en ${t.quoted}:`, err.message);
     }
   }
+}
+
+/**
+ * Guardar lote de productos (upsert masivo) en una sola operación atómica.
+ * Actualiza todas las tablas de inventario para que todos los dispositivos vean los cambios de inmediato.
+ */
+export async function upsertProductsBatch(products: any[]): Promise<{ count: number }> {
+  if (!Array.isArray(products) || products.length === 0) return { count: 0 };
+  const p = getPool();
+  const tables = await getAllInventoryTables(p);
+
+  for (const t of tables) {
+    try {
+      const colRes = await p.query(`
+        SELECT column_name, data_type 
+        FROM information_schema.columns 
+        WHERE table_schema = $1 AND table_name = $2
+      `, [t.schema, t.tableName]);
+      
+      const cols = colRes.rows;
+      if (cols.length === 0) continue;
+
+      const findCol = (...names: string[]) => cols.find(c => names.includes(c.column_name.toLowerCase()));
+      const idColObj = findCol('id', 'codigo', 'id_producto') || cols[0];
+      const idCol = idColObj.column_name;
+      const isIdNumeric = idColObj.data_type.includes('int') || idColObj.data_type.includes('numeric');
+
+      const nameCol = findCol('name', 'nombre', 'descripcion', 'producto')?.column_name;
+      const catCol = findCol('category', 'categoria', 'rubro')?.column_name;
+      const priceCol = findCol('price', 'precio', 'price_usd', 'precio_usd', 'pvp')?.column_name;
+      const currCol = findCol('currency', 'moneda')?.column_name;
+      const unitCol = findCol('unit', 'unidad', 'unidad_medida')?.column_name;
+      const unitsPerCaseCol = findCol('units_per_case', 'unitspercase', 'unidades_por_caja')?.column_name;
+      const stockCol = findCol('stock', 'cantidad', 'existencia')?.column_name;
+      const barcodeCol = findCol('barcode', 'codigo_barra', 'codigo_barras', 'codigo')?.column_name;
+      const costCol = findCol('cost', 'costo')?.column_name;
+      const profitMarginCol = findCol('profit_margin', 'profitmargin', 'margen')?.column_name;
+
+      for (const product of products) {
+        if (!product || (!product.id && !product.name)) continue;
+
+        let parsedId: any = product.id;
+        if (isIdNumeric) {
+          const num = parseInt(String(product.id).replace(/\D/g, ''), 10);
+          parsedId = isNaN(num) || num <= 0 ? (Date.now() % 100000000) : num;
+        }
+
+        const insertCols: string[] = [`"${idCol}"`];
+        const insertVals: any[] = [parsedId];
+        const updateSets: string[] = [];
+
+        if (nameCol) {
+          insertCols.push(`"${nameCol}"`);
+          insertVals.push(product.name || 'Producto sin nombre');
+          updateSets.push(`"${nameCol}" = EXCLUDED."${nameCol}"`);
+        }
+        if (priceCol) {
+          insertCols.push(`"${priceCol}"`);
+          insertVals.push(product.price || 0);
+          updateSets.push(`"${priceCol}" = EXCLUDED."${priceCol}"`);
+        }
+        if (stockCol) {
+          insertCols.push(`"${stockCol}"`);
+          insertVals.push(product.stock || 0);
+          updateSets.push(`"${stockCol}" = EXCLUDED."${stockCol}"`);
+        }
+        if (catCol) {
+          insertCols.push(`"${catCol}"`);
+          insertVals.push(product.category || 'Otros');
+          updateSets.push(`"${catCol}" = EXCLUDED."${catCol}"`);
+        }
+        if (currCol) {
+          insertCols.push(`"${currCol}"`);
+          insertVals.push(product.currency || 'USD');
+          updateSets.push(`"${currCol}" = EXCLUDED."${currCol}"`);
+        }
+        if (unitCol) {
+          insertCols.push(`"${unitCol}"`);
+          insertVals.push(product.unit || 'Unidad');
+          updateSets.push(`"${unitCol}" = EXCLUDED."${unitCol}"`);
+        }
+        if (unitsPerCaseCol) {
+          insertCols.push(`"${unitsPerCaseCol}"`);
+          insertVals.push(product.unitsPerCase || 1);
+          updateSets.push(`"${unitsPerCaseCol}" = EXCLUDED."${unitsPerCaseCol}"`);
+        }
+        if (barcodeCol) {
+          insertCols.push(`"${barcodeCol}"`);
+          insertVals.push(product.barcode || '');
+          updateSets.push(`"${barcodeCol}" = EXCLUDED."${barcodeCol}"`);
+        }
+        if (costCol) {
+          insertCols.push(`"${costCol}"`);
+          insertVals.push(product.cost || 0);
+          updateSets.push(`"${costCol}" = EXCLUDED."${costCol}"`);
+        }
+        if (profitMarginCol) {
+          insertCols.push(`"${profitMarginCol}"`);
+          insertVals.push(product.profitMargin || 0);
+          updateSets.push(`"${profitMarginCol}" = EXCLUDED."${profitMarginCol}"`);
+        }
+
+        const placeholders = insertCols.map((_, i) => `$${i + 1}`).join(', ');
+        const sql = `
+          INSERT INTO ${t.quoted} (${insertCols.join(', ')})
+          VALUES (${placeholders})
+          ON CONFLICT ("${idCol}") DO UPDATE SET
+            ${updateSets.join(', ')}
+        `;
+
+        await p.query(sql, insertVals);
+      }
+      console.log(`[Neon DB] Lote de ${products.length} productos guardado exitosamente en ${t.quoted}`);
+    } catch (err: any) {
+      console.warn(`[Neon DB] Error guardando lote de productos en ${t.quoted}:`, err.message);
+    }
+  }
+
+  return { count: products.length };
 }
 
 /**

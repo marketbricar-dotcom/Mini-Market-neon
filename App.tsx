@@ -81,7 +81,11 @@ const App: React.FC = () => {
   const isStandalonePublicCatalog = useMemo(() => {
     try {
       const urlParams = new URLSearchParams(window.location.search);
-      return urlParams.get('public') === 'true' || urlParams.get('standalone') === 'true';
+      return urlParams.get('public') === 'true' || 
+             urlParams.get('standalone') === 'true' ||
+             urlParams.get('catalogo') === 'true' ||
+             urlParams.get('catalogo') === '1' ||
+             window.location.hash.toLowerCase().includes('catalogo');
     } catch {
       return false;
     }
@@ -318,20 +322,46 @@ const App: React.FC = () => {
 
     const inventoryMap = new Map<string, Product>();
 
-    if (Array.isArray(dbInventory) && dbInventory.length > 0) {
-      // Si la base de datos respondió productos, ellos son la fuente de la verdad
+    // 1. Productos de la base de datos centralizada (Neon PostgreSQL) son la fuente de la verdad
+    if (Array.isArray(dbInventory)) {
       dbInventory.forEach(p => { if (p && p.id) inventoryMap.set(p.id, p); });
-    } else {
-      // Si la base de datos no tiene productos aún o está offline, usar caché local
-      (Array.isArray(savedLocalInventory) ? savedLocalInventory : []).forEach(p => { if (p && p.id) inventoryMap.set(p.id, p); });
-      (Array.isArray(inventoryRef.current) ? inventoryRef.current : []).forEach(p => { if (p && p.id) inventoryMap.set(p.id, p); });
     }
 
     const safeProdDeletions = Array.isArray(queue.productDeletions) ? queue.productDeletions : [];
+
+    // 2. Si este dispositivo tiene productos locales (por ejemplo, importados previamente o cargados en caché)
+    // que aún no existen en Neon, NO borrarlos: mantenerlos y auto-encolarlos para subirlos a Neon
+    const localProds = [
+      ...(Array.isArray(savedLocalInventory) ? savedLocalInventory : []),
+      ...(Array.isArray(inventoryRef.current) ? inventoryRef.current : [])
+    ];
+    const missingInDb: Product[] = [];
+
+    localProds.forEach(lp => {
+      if (lp && lp.id && !safeProdDeletions.includes(lp.id)) {
+        if (!inventoryMap.has(lp.id)) {
+          inventoryMap.set(lp.id, lp);
+          missingInDb.push(lp);
+        }
+      }
+    });
+
+    // Si encontramos productos en este dispositivo ausentes en Neon, ponerlos en la cola de subida
+    if (missingInDb.length > 0) {
+      const existingQueueIds = new Set((queue.products || []).map(p => p.id));
+      const toAdd = missingInDb.filter(p => !existingQueueIds.has(p.id));
+      if (toAdd.length > 0) {
+        queue.products = [...(queue.products || []), ...toAdd];
+        savePendingQueue(queue);
+      }
+    }
+
+    // 3. Aplicar eliminaciones pendientes
     if (safeProdDeletions.length > 0) {
       safeProdDeletions.forEach(delId => inventoryMap.delete(delId));
     }
 
+    // 4. Aplicar cambios locales pendientes más recientes
     const safeQueueProducts = Array.isArray(queue.products) ? queue.products : [];
     safeQueueProducts.forEach(qp => { if (qp && qp.id) inventoryMap.set(qp.id, qp); });
 
@@ -355,7 +385,7 @@ const App: React.FC = () => {
     };
   };
 
-  // Sube todos los cambios pendientes acumulados localmente a Supabase
+  // Sube todos los cambios pendientes acumulados localmente a Supabase / Neon
   const processSyncQueue = async (): Promise<boolean> => {
     if (!supabaseService.isEnabled()) return false;
 
@@ -397,16 +427,21 @@ const App: React.FC = () => {
         }
       }
 
-      // 4. Sincronizar productos nuevos/actualizados
+      // 4. Sincronizar productos nuevos/actualizados (usa batch para máxima velocidad y sincronización atómica)
       if (queue.products.length > 0) {
-        const remaining: Product[] = [];
-        for (const prod of queue.products) {
+        if (queue.products.length > 1) {
+          const ok = await supabaseService.saveProductsBatch(queue.products);
+          if (ok) {
+            queue.products = [];
+            queueModified = true;
+          }
+        } else {
+          const prod = queue.products[0];
           const ok = await supabaseService.saveProduct(prod, false);
-          if (!ok) remaining.push(prod);
-        }
-        if (remaining.length !== queue.products.length) {
-          queue.products = remaining;
-          queueModified = true;
+          if (ok) {
+            queue.products = [];
+            queueModified = true;
+          }
         }
       }
 
@@ -634,7 +669,7 @@ const App: React.FC = () => {
     if (supabaseService.isEnabled()) {
       unsubscribeRealtime = supabaseService.subscribeToRealtime((tableName) => {
         console.log(`⚡ Evento en tiempo real recibido en la tabla '${tableName}'. Actualizando interfaz...`);
-        triggerBackgroundSync();
+        triggerBackgroundSync(true);
       });
     }
 
@@ -687,6 +722,15 @@ const App: React.FC = () => {
     queue.products = [...queue.products.filter(p => p.id !== product.id), product];
     savePendingQueue(queue);
 
+    // Guardar inmediatamente en Neon para sincronización en tiempo real con todos los dispositivos
+    supabaseService.saveProduct(product, true).then(ok => {
+      if (ok) {
+        const currentQ = getPendingQueue();
+        currentQ.products = currentQ.products.filter(p => p.id !== product.id);
+        savePendingQueue(currentQ);
+      }
+    }).catch(() => {});
+
     triggerBackgroundSync();
   };
 
@@ -696,6 +740,15 @@ const App: React.FC = () => {
     const queue = getPendingQueue();
     queue.products = [...queue.products.filter(p => p.id !== product.id), product];
     savePendingQueue(queue);
+
+    // Guardar inmediatamente en Neon para propagar el cambio al instante
+    supabaseService.saveProduct(product, false).then(ok => {
+      if (ok) {
+        const currentQ = getPendingQueue();
+        currentQ.products = currentQ.products.filter(p => p.id !== product.id);
+        savePendingQueue(currentQ);
+      }
+    }).catch(() => {});
 
     triggerBackgroundSync();
   };
@@ -709,6 +762,15 @@ const App: React.FC = () => {
       queue.productDeletions.push(id);
     }
     savePendingQueue(queue);
+
+    // Eliminar inmediatamente en Neon para propagar al instante
+    supabaseService.deleteProduct(id).then(ok => {
+      if (ok) {
+        const currentQ = getPendingQueue();
+        currentQ.productDeletions = currentQ.productDeletions.filter(delId => delId !== id);
+        savePendingQueue(currentQ);
+      }
+    }).catch(() => {});
 
     triggerBackgroundSync();
   };
@@ -783,6 +845,18 @@ const App: React.FC = () => {
       }
 
       savePendingQueue(queue);
+
+      // Guardar de inmediato en Neon para propagación instantánea a todas las pantallas/dispositivos
+      salesList.forEach(sale => {
+        supabaseService.saveSale(sale, safeInventory).then(ok => {
+          if (ok) {
+            const currentQ = getPendingQueue();
+            currentQ.sales = currentQ.sales.filter(s => s && s.id !== sale.id);
+            savePendingQueue(currentQ);
+          }
+        }).catch(() => {});
+      });
+
       triggerBackgroundSync();
     } catch (err) {
       console.error('Error al procesar la venta en App:', err);
@@ -950,14 +1024,19 @@ const App: React.FC = () => {
             return updated;
           });
           
-          // Cola de sincronización
+          // Cola de sincronización de respaldo
           const queue = getPendingQueue();
           parsed.forEach((vp: any) => {
             queue.products = [...queue.products.filter(p => p.id !== vp.id), vp];
           });
           savePendingQueue(queue);
+
+          // Subir directamente a Neon en batch
+          supabaseService.saveProductsBatch(parsed).then(ok => {
+            if (ok) triggerBackgroundSync(true);
+          }).catch(() => {});
           
-          alert('¡Inventario recuperado exitosamente! Los productos han vuelto a la lista. Sincronizando con Supabase en segundo plano...');
+          alert('¡Inventario recuperado exitosamente! Los productos han vuelto a la lista y se sincronizan con todos los dispositivos.');
           triggerBackgroundSync();
           scanLocalStorage();
         }
@@ -1087,7 +1166,12 @@ const App: React.FC = () => {
           });
           savePendingQueue(queue);
 
-          alert(`¡Se importaron ${validProducts.length} productos con éxito! Iniciando sincronización en segundo plano...`);
+          // Subir directamente a Neon en batch para propagación instantánea a todos los teléfonos
+          supabaseService.saveProductsBatch(validProducts).then(ok => {
+            if (ok) triggerBackgroundSync(true);
+          }).catch(() => {});
+
+          alert(`¡Se importaron ${validProducts.length} productos con éxito! Sincronizando con todos los dispositivos...`);
           triggerBackgroundSync();
         }
       } catch (err: any) {
