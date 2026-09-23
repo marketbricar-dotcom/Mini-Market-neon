@@ -134,6 +134,13 @@ export const databaseService = {
       isConfiguredState = !!data.configured;
       isConnectedState = !!data.connected;
 
+      if (data.databaseUrl && !localNeonUrl) {
+        localNeonUrl = data.databaseUrl;
+        try {
+          localStorage.setItem(STORAGE_KEY_NEON_URL, data.databaseUrl);
+        } catch {}
+      }
+
       return {
         success: !!data.connected && (!data.missingTables || data.missingTables.length === 0),
         configured: !!data.configured,
@@ -141,6 +148,7 @@ export const databaseService = {
         error: data.error,
         isOffline: false,
         databaseUrlMasked: data.databaseUrlMasked,
+        databaseUrl: data.databaseUrl,
       };
     } catch (err: any) {
       return {

@@ -1,15 +1,44 @@
 import { Pool } from 'pg';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 dotenv.config();
 
-let runtimeDatabaseUrl: string | null = null;
+const CONFIG_FILE = path.join(process.cwd(), '.neon_config.json');
+
+function loadPersistedUrl(): string | null {
+  try {
+    if (fs.existsSync(CONFIG_FILE)) {
+      const content = fs.readFileSync(CONFIG_FILE, 'utf8');
+      const parsed = JSON.parse(content);
+      if (parsed && typeof parsed.databaseUrl === 'string' && parsed.databaseUrl.trim()) {
+        return parsed.databaseUrl.trim();
+      }
+    }
+  } catch {}
+  return null;
+}
+
+let runtimeDatabaseUrl: string | null = loadPersistedUrl();
 
 export function getDatabaseUrl(): string {
-  return runtimeDatabaseUrl || process.env.DATABASE_URL || '';
+  return runtimeDatabaseUrl || loadPersistedUrl() || process.env.DATABASE_URL || '';
 }
 
 export function setRuntimeDatabaseUrl(url: string | null) {
-  runtimeDatabaseUrl = url ? url.trim() : null;
+  const cleaned = url ? url.trim() : null;
+  runtimeDatabaseUrl = cleaned;
+  try {
+    if (cleaned) {
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify({ databaseUrl: cleaned, updatedAt: new Date().toISOString() }));
+    } else {
+      if (fs.existsSync(CONFIG_FILE)) {
+        fs.unlinkSync(CONFIG_FILE);
+      }
+    }
+  } catch (e) {
+    console.warn('[Neon DB] Error guardando config en disco:', e);
+  }
   resetPool();
 }
 

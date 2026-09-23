@@ -19,7 +19,7 @@ import {
   saveSaleTransaction,
   deleteSale,
   updateSale,
-} from './server/neonDb';
+} from './server/neonDb.ts';
 
 dotenv.config();
 
@@ -50,6 +50,18 @@ async function startServer() {
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true }));
 
+  // CORS y cabeceras para compatibilidad multi-dispositivo y móviles
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+      res.sendStatus(200);
+      return;
+    }
+    next();
+  });
+
   // --- API Routes ---
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', time: new Date().toISOString() });
@@ -74,6 +86,7 @@ async function startServer() {
         ...status,
         provider: 'Neon.tech PostgreSQL',
         databaseUrlMasked: maskedUrl,
+        databaseUrl: currentUrl,
         hasEnvUrl: !!process.env.DATABASE_URL,
       });
     } catch (err: any) {
@@ -368,8 +381,12 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*all', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.use((req, res, next) => {
+      if (req.method === 'GET' && !req.path.startsWith('/api')) {
+        res.sendFile(path.join(distPath, 'index.html'));
+      } else {
+        next();
+      }
     });
   }
 

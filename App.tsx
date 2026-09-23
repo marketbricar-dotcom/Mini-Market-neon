@@ -346,13 +346,23 @@ const App: React.FC = () => {
       }
     });
 
-    // Si encontramos productos en este dispositivo ausentes en Neon, ponerlos en la cola de subida
+    // Si encontramos productos en este dispositivo ausentes en Neon, ponerlos en la cola de subida y enviarlos de inmediato a Neon
     if (missingInDb.length > 0) {
       const existingQueueIds = new Set((queue.products || []).map(p => p.id));
       const toAdd = missingInDb.filter(p => !existingQueueIds.has(p.id));
       if (toAdd.length > 0) {
         queue.products = [...(queue.products || []), ...toAdd];
         savePendingQueue(queue);
+
+        // Subir de inmediato a Neon para que cualquier otro dispositivo lo vea sin demora
+        supabaseService.saveProductsBatch(toAdd).then(ok => {
+          if (ok) {
+            const curQ = getPendingQueue();
+            const toAddIds = new Set(toAdd.map(p => p.id));
+            curQ.products = (curQ.products || []).filter(p => !toAddIds.has(p.id));
+            savePendingQueue(curQ);
+          }
+        }).catch(() => {});
       }
     }
 
@@ -591,6 +601,10 @@ const App: React.FC = () => {
         setInventory(merged.inventory);
         setSales(merged.sales);
         setCriticalThreshold(merged.threshold);
+
+        if ((conn as any).databaseUrl) {
+          setDbConfigUrl((conn as any).databaseUrl);
+        }
         
         setSyncStatus({
           connected: true,
